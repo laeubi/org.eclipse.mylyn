@@ -15,23 +15,22 @@
 
 package org.eclipse.mylyn.internal.jenkins.ui;
 
-import java.net.URISyntaxException;
+import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.InetAddress;
+import java.net.MulticastSocket;
+import java.net.NetworkInterface;
+import java.net.SocketException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.Status;
-import org.eclipse.ecf.core.ContainerConnectException;
-import org.eclipse.ecf.core.ContainerCreateException;
-import org.eclipse.ecf.core.ContainerFactory;
-import org.eclipse.ecf.core.IContainer;
-import org.eclipse.ecf.discovery.IDiscoveryLocator;
-import org.eclipse.ecf.discovery.IServiceEvent;
-import org.eclipse.ecf.discovery.IServiceInfo;
-import org.eclipse.ecf.discovery.IServiceListener;
-import org.eclipse.ecf.discovery.IServiceProperties;
-import org.eclipse.ecf.discovery.identity.IServiceID;
-import org.eclipse.ecf.discovery.identity.IServiceTypeID;
 import org.eclipse.mylyn.builds.ui.BuildsUi;
 import org.eclipse.mylyn.commons.core.StatusHandler;
 import org.eclipse.mylyn.commons.repositories.core.RepositoryLocation;
@@ -44,69 +43,25 @@ import org.eclipse.osgi.util.NLS;
  * @author Steffen Pingel
  */
 public class JenkinsDiscovery {
-	/**
-	 * This class works around a source incompatibility between the org.eclipse.ecf.discovery version in Luna and earlier versions. Version
-	 * 5.0 added the triggerDiscovery method to IServiceListener. This class can be extended in order to implement this method without
-	 * the @Overide annotation causing compilation to fail against earlier versions (e.g. Kepler).
-	 */
-	private static abstract class AbstractServiceListener {
-		public abstract boolean triggerDiscovery();
-	}
 
-	private final class JenkinsServiceListener extends AbstractServiceListener implements IServiceListener {
-		@Override
-		public void serviceDiscovered(IServiceEvent anEvent) {
-			IServiceInfo serviceInfo = anEvent.getServiceInfo();
-			IServiceID serviceId = serviceInfo.getServiceID();
-			IServiceTypeID serviceTypeId = serviceId.getServiceTypeID();
-			// Note that Jenkins will claim that it's both Jenkins and
-			// Hudson for backward compatibility.
-			if (serviceTypeId.getName().equals(JENKINS_MDNS_ID)) {
-				IServiceProperties properties = serviceInfo.getServiceProperties();
-				try {
-					if (properties.getProperty(URL_PROPERTY) == null) {
-						notifyMessage(Messages.JenkinsDiscovery_MessageTitle,
-								NLS.bind(Messages.JenkinsDiscovery_MissingURL,
-										new Object[] { serviceInfo.getLocation().getHost() }));
-					} else {
-						issueJenkinsNotification(properties);
-					}
-				} catch (URISyntaxException e) {
-					StatusHandler.log(new Status(IStatus.ERROR, JenkinsConnectorUi.ID_PLUGIN,
-							NLS.bind(Messages.Discovery_IncorrectURI,
-									new Object[] { properties.getProperty(URL_PROPERTY).toString() }),
-							e));
-				}
-			}
-		}
+	private static final String MDNS_ADDRESS = "224.0.0.251"; //$NON-NLS-1$
 
-		@Override
-		public void serviceUndiscovered(IServiceEvent anEvent) {
-			// Ignore this for now
-		}
+	private static final int MDNS_PORT = 5353;
 
-		@Override
-		public boolean triggerDiscovery() {
-			return false;
-		}
-	}
-
-	private static final String ECF_DISCOVERY_JMDNS = "ecf.discovery.jmdns"; //$NON-NLS-1$
-
-	private static final String JENKINS_MDNS_ID = "_jenkins._tcp.local._iana"; //$NON-NLS-1$
+	private static final String JENKINS_SERVICE_TYPE = "_jenkins._tcp.local"; //$NON-NLS-1$
 
 	private static final String URL_PROPERTY = "url"; //$NON-NLS-1$
 
 	/** Server id property name (Jenkins only). */
 	private static final String SERVER_ID_PROPERTY = "server-id"; //$NON-NLS-1$
 
-	private IContainer container;
+	private volatile boolean running;
+
+	private Thread discoveryThread;
+
+	private MulticastSocket socket;
 
 	public JenkinsDiscovery() {
-	}
-
-	protected IContainer getContainer() throws ContainerCreateException {
-		return ContainerFactory.getDefault().createContainer(ECF_DISCOVERY_JMDNS);
 	}
 
 	/**
@@ -132,22 +87,242 @@ public class JenkinsDiscovery {
 	}
 
 	public void start() {
-		try {
-			container = getContainer();
-			final IDiscoveryLocator adapter = container.getAdapter(IDiscoveryLocator.class);
-			adapter.addServiceListener(new JenkinsServiceListener());
-			container.connect(null, null);
-
-		} catch (ContainerCreateException | ContainerConnectException e) {
-			StatusHandler.log(new Status(IStatus.WARNING, JenkinsConnectorUi.ID_PLUGIN,
-					Messages.Discovery_CouldNotStartService, e));
+		if (running) {
+			return;
 		}
+		running = true;
+		discoveryThread = new Thread(this::runDiscovery, "Jenkins mDNS Discovery"); //$NON-NLS-1$
+		discoveryThread.setDaemon(true);
+		discoveryThread.start();
 	}
 
 	public void stop() {
-		if (container != null) {
-			container.disconnect();
-			container = null;
+		running = false;
+		if (socket != null) {
+			socket.close();
+		}
+		if (discoveryThread != null) {
+			discoveryThread.interrupt();
+			try {
+				discoveryThread.join(1000);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+			discoveryThread = null;
+		}
+	}
+
+	private void runDiscovery() {
+		try {
+			InetAddress group = InetAddress.getByName(MDNS_ADDRESS);
+			socket = new MulticastSocket(MDNS_PORT);
+			
+			// Join multicast group on all available network interfaces
+			for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+				if (ni.isUp() && ni.supportsMulticast() && !ni.isLoopback()) {
+					try {
+						socket.joinGroup(new java.net.InetSocketAddress(group, MDNS_PORT), ni);
+					} catch (IOException e) {
+						// Some interfaces may not support multicast, continue with others
+					}
+				}
+			}
+
+			byte[] buffer = new byte[9000];
+			DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+
+			while (running) {
+				try {
+					socket.receive(packet);
+					processMdnsPacket(packet.getData(), packet.getLength());
+				} catch (SocketException e) {
+					if (running) {
+						// Only log if we're still supposed to be running
+						StatusHandler.log(new Status(IStatus.WARNING, JenkinsConnectorUi.ID_PLUGIN,
+								"Error receiving mDNS packet", e)); //$NON-NLS-1$
+					}
+					break;
+				} catch (IOException e) {
+					if (running) {
+						StatusHandler.log(new Status(IStatus.WARNING, JenkinsConnectorUi.ID_PLUGIN,
+								"Error processing mDNS packet", e)); //$NON-NLS-1$
+					}
+				}
+			}
+		} catch (IOException e) {
+			StatusHandler.log(
+					new Status(IStatus.WARNING, JenkinsConnectorUi.ID_PLUGIN, Messages.Discovery_CouldNotStartService, e));
+		} finally {
+			if (socket != null) {
+				socket.close();
+			}
+		}
+	}
+
+	private void processMdnsPacket(byte[] data, int length) {
+		try {
+			ByteBuffer buffer = ByteBuffer.wrap(data, 0, length);
+			
+			// Skip DNS header (12 bytes)
+			if (buffer.remaining() < 12) {
+				return;
+			}
+			buffer.position(12);
+
+			// Read question section (skip it)
+			int questionCount = ((data[4] & 0xFF) << 8) | (data[5] & 0xFF);
+			for (int i = 0; i < questionCount; i++) {
+				skipName(buffer);
+				if (buffer.remaining() < 4) {
+					return;
+				}
+				buffer.getInt(); // Skip QTYPE and QCLASS
+			}
+
+			// Read answer section
+			int answerCount = ((data[6] & 0xFF) << 8) | (data[7] & 0xFF);
+			for (int i = 0; i < answerCount; i++) {
+				processRecord(buffer, data);
+			}
+
+			// Read additional section for TXT records with service properties
+			int additionalCount = ((data[10] & 0xFF) << 8) | (data[11] & 0xFF);
+			for (int i = 0; i < additionalCount; i++) {
+				processRecord(buffer, data);
+			}
+		} catch (java.nio.BufferUnderflowException | IndexOutOfBoundsException e) {
+			// Silently ignore malformed packets
+		}
+	}
+
+	private void processRecord(ByteBuffer buffer, byte[] data) {
+		String name = readName(buffer, data);
+		if (buffer.remaining() < 10) {
+			return;
+		}
+
+		int type = buffer.getShort() & 0xFFFF;
+		buffer.getShort(); // Skip class
+		buffer.getInt(); // Skip TTL
+		int rdLength = buffer.getShort() & 0xFFFF;
+
+		if (buffer.remaining() < rdLength) {
+			return;
+		}
+
+		// Check if this is a TXT record (type 16) for Jenkins service
+		if (type == 16 && name != null && name.contains(JENKINS_SERVICE_TYPE)) {
+			byte[] rdata = new byte[rdLength];
+			buffer.get(rdata);
+			Map<String, String> properties = parseTxtRecord(rdata);
+			handleJenkinsService(properties);
+		} else {
+			// Skip the record data
+			buffer.position(buffer.position() + rdLength);
+		}
+	}
+
+	private String readName(ByteBuffer buffer, byte[] data) {
+		StringBuilder name = new StringBuilder();
+		int jumps = 0;
+		int savedPosition = -1;
+
+		while (buffer.hasRemaining()) {
+			int length = buffer.get() & 0xFF;
+			if (length == 0) {
+				break;
+			}
+
+			// Check for pointer (compression)
+			if ((length & 0xC0) == 0xC0) {
+				if (!buffer.hasRemaining()) {
+					break;
+				}
+				int pointer = ((length & 0x3F) << 8) | (buffer.get() & 0xFF);
+				if (savedPosition == -1) {
+					savedPosition = buffer.position();
+				}
+				buffer.position(pointer);
+				jumps++;
+				if (jumps > 10) { // Prevent infinite loops
+					break;
+				}
+				continue;
+			}
+
+			if (buffer.remaining() < length) {
+				break;
+			}
+
+			if (name.length() > 0) {
+				name.append('.');
+			}
+
+			byte[] label = new byte[length];
+			buffer.get(label);
+			name.append(new String(label, StandardCharsets.UTF_8));
+		}
+
+		if (savedPosition != -1) {
+			buffer.position(savedPosition);
+		}
+
+		return name.toString();
+	}
+
+	private void skipName(ByteBuffer buffer) {
+		while (buffer.hasRemaining()) {
+			int length = buffer.get() & 0xFF;
+			if (length == 0) {
+				break;
+			}
+			if ((length & 0xC0) == 0xC0) {
+				if (buffer.hasRemaining()) {
+					buffer.get(); // Skip second byte of pointer
+				}
+				break;
+			}
+			if (buffer.remaining() < length) {
+				break;
+			}
+			buffer.position(buffer.position() + length);
+		}
+	}
+
+	private Map<String, String> parseTxtRecord(byte[] rdata) {
+		Map<String, String> properties = new HashMap<>();
+		ByteBuffer buffer = ByteBuffer.wrap(rdata);
+
+		while (buffer.hasRemaining()) {
+			int txtLength = buffer.get() & 0xFF;
+			if (txtLength == 0 || buffer.remaining() < txtLength) {
+				break;
+			}
+
+			byte[] txtData = new byte[txtLength];
+			buffer.get(txtData);
+			String txt = new String(txtData, StandardCharsets.UTF_8);
+
+			int equalsIndex = txt.indexOf('=');
+			if (equalsIndex >= 0) {
+				String key = equalsIndex > 0 ? txt.substring(0, equalsIndex) : ""; //$NON-NLS-1$
+				String value = equalsIndex < txt.length() - 1 ? txt.substring(equalsIndex + 1) : ""; //$NON-NLS-1$
+				if (!key.isEmpty()) {
+					properties.put(key, value);
+				}
+			}
+		}
+
+		return properties;
+	}
+
+	private void handleJenkinsService(Map<String, String> properties) {
+		String url = properties.get(URL_PROPERTY);
+		if (url == null) {
+			notifyMessage(Messages.JenkinsDiscovery_MessageTitle,
+					Messages.JenkinsDiscovery_MissingURL);
+		} else {
+			issueJenkinsNotification(properties);
 		}
 	}
 
@@ -155,8 +330,8 @@ public class JenkinsDiscovery {
 		BuildsUi.serverDiscovered(title, description);
 	}
 
-	private void issueJenkinsNotification(IServiceProperties properties) throws URISyntaxException {
-		String url = properties.getProperty(URL_PROPERTY).toString();
+	private void issueJenkinsNotification(Map<String, String> properties) {
+		String url = properties.get(URL_PROPERTY);
 		String id = getId(properties);
 		if (isNew(url, id)) {
 			// Change the first segment (org.eclipse.mylyn.hudson) to the id of
@@ -166,8 +341,8 @@ public class JenkinsDiscovery {
 		}
 	}
 
-	private String getId(IServiceProperties properties) {
-		String id = (String) properties.getProperty(SERVER_ID_PROPERTY);
+	private String getId(Map<String, String> properties) {
+		String id = properties.get(SERVER_ID_PROPERTY);
 		if (id == null) {
 			id = UUID.randomUUID().toString();
 		}
