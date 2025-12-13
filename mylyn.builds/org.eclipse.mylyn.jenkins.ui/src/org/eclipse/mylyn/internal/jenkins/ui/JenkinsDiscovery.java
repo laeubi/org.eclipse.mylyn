@@ -190,7 +190,7 @@ public class JenkinsDiscovery {
 			for (int i = 0; i < additionalCount; i++) {
 				processRecord(buffer, data);
 			}
-		} catch (Exception e) {
+		} catch (java.nio.BufferUnderflowException | IndexOutOfBoundsException e) {
 			// Silently ignore malformed packets
 		}
 	}
@@ -304,10 +304,12 @@ public class JenkinsDiscovery {
 			String txt = new String(txtData, StandardCharsets.UTF_8);
 
 			int equalsIndex = txt.indexOf('=');
-			if (equalsIndex > 0) {
-				String key = txt.substring(0, equalsIndex);
-				String value = txt.substring(equalsIndex + 1);
-				properties.put(key, value);
+			if (equalsIndex >= 0) {
+				String key = equalsIndex > 0 ? txt.substring(0, equalsIndex) : ""; //$NON-NLS-1$
+				String value = equalsIndex < txt.length() - 1 ? txt.substring(equalsIndex + 1) : ""; //$NON-NLS-1$
+				if (!key.isEmpty()) {
+					properties.put(key, value);
+				}
 			}
 		}
 
